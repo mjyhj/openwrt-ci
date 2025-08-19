@@ -3,7 +3,7 @@ name: IPQ60XX-6.12-WIFI
 on:
   workflow_dispatch:
   schedule:
-    - cron: 0 19 * * *
+    - cron: 0 19 * * 1
 
 env:
   REPO_URL: https://github.com/LiBwrt/openwrt-6.x.git
@@ -82,6 +82,8 @@ jobs:
         echo "DEVICE_TARGET=$DEVICE_TARGET" >> $GITHUB_ENV
         DEVICE_SUBTARGET=$(cat .config | grep CONFIG_TARGET_SUBTARGET | awk -F '"' '{print $2}')
         echo "DEVICE_SUBTARGET=$DEVICE_SUBTARGET" >> $GITHUB_ENV
+        echo "FIRMWARE_TAG=IPQ60XX-6.12-WIFI-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_ENV
+
 
     - name: Cache Toolchain(缓存工具链)
       if: env.CACHE_TOOLCHAIN == 'true'
@@ -105,9 +107,6 @@ jobs:
       run: |
         [ -e files ] && mv files $OPENWRT_PATH/files
         [ -e $CONFIG_FILE ] && mv $CONFIG_FILE $OPENWRT_PATH/.config
-        chmod +x $DIY_SCRIPT
-        cd $OPENWRT_PATH
-        $GITHUB_WORKSPACE/$DIY_SCRIPT
 
     - name: Download DL Package(下载DL软件包)
       run: |
@@ -116,6 +115,25 @@ jobs:
         make download -j8
         find dl -size -1024c -exec ls -l {} \;
         find dl -size -1024c -exec rm -f {} \;
+        
+    - name: Customize opkg distfeeds.conf for USTC mirrors
+      working-directory: ${{ env.OPENWRT_PATH }}
+      run: |
+        # 创建所需的目录结构，-p 选项确保在目录已存在时不报错
+        mkdir -p ./files/etc/opkg
+
+        # 使用 "here document" (cat <<'EOF') 方法将多行文本写入文件
+        # 这种方法会完全覆盖目标文件，确保不保留任何原始内容
+        # 使用 'EOF' (带单引号) 可以防止任何 Shell 变量扩展，确保内容原样写入
+        cat <<'EOF' > ./files/etc/opkg/distfeeds.conf
+        src/gz libwrt_base https://chinanet.mirrors.ustc.edu.cn/immortalwrt/releases/24.10.2/packages/aarch64_cortex-a53/base
+        src/gz libwrt_luci https://chinanet.mirrors.ustc.edu.cn/immortalwrt/releases/24.10.2/packages/aarch64_cortex-a53/luci/
+        src/gz libwrt_packages https://chinanet.mirrors.ustc.edu.cn/immortalwrt/releases/24.10.2/packages/aarch64_cortex-a53/packages
+        src/gz libwrt_routing https://chinanet.mirrors.ustc.edu.cn/immortalwrt/releases/24.10.2/packages/aarch64_cortex-a53/routing
+        src/gz libwrt_telephony https://chinanet.mirrors.ustc.edu.cn/immortalwrt/releases/24.10.2/packages/aarch64_cortex-a53/telephony
+        EOF
+        
+        echo "Successfully created custom distfeeds.conf."
 
     - name: Compile Firmware(开始编译固件)
       id: compile
@@ -144,7 +162,7 @@ jobs:
         cd $OPENWRT_PATH/bin/targets/*/*
         cat sha256sums
         cp $OPENWRT_PATH/.config build.config
-        mv -f $OPENWRT_PATH/bin/packages/*/*/*.apk packages
+        mv -f $OPENWRT_PATH/bin/packages/*/*/*.ipk packages
         tar -zcf Packages.tar.gz packages
         rm -rf packages feeds.buildinfo version.buildinfo
         echo "FIRMWARE_PATH=$PWD" >> $GITHUB_ENV
@@ -161,7 +179,7 @@ jobs:
       uses: ncipollo/release-action@v1
       with:
         name: R${{ env.DATE }} for ${{ env.FIRMWARE_TAG }}
-        allowUpdates: true
+        allowUpdates: false
         tag: ${{ env.FIRMWARE_TAG }}
         token: ${{ secrets.GITHUB_TOKEN }}
         artifacts: ${{ env.FIRMWARE_PATH }}/*
@@ -178,3 +196,35 @@ jobs:
           - 固件内核版本：${{ env.VERSION_KERNEL }}
           - 固件编译前最后一次➦[主源码](${{ env.REPO_URL }})更新记录
           - ${{ env.VERSION_INFO }}
+
+
+# 新增一个专门用于清理旧版本的 Job
+  Cleanup-Releases:
+    needs: [Build]
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install jq -y
+
+      - name: Delete old releases and tags except latest 3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          # 获取所有 release 信息，保留最新 3 个，其余全部删除
+          releases=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/$REPO/releases?per_page=100")
+          # 获取要删除的 release id 和 tag_name
+          ids_and_tags=$(echo "$releases" | jq -r '.[3:][] | "\(.id) \(.tag_name)"')
+          # 循环删除 release 和 tag
+          while read -r release_id tag_name; do
+            # 删除 release
+            curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/$REPO/releases/$release_id"
+            # 删除 tag，refs/tags/{tag_name}
+            curl -s -X DELETE -H "Authorization: token $GITHUB_TOKEN" \
+              "https://api.github.com/repos/$REPO/git/refs/tags/$tag_name"
+            echo "Deleted release $release_id and tag $tag_name"
+          done <<< "$ids_and_tags"
